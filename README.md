@@ -2,7 +2,7 @@
 
 Built this to understand how task queues like Celery actually work under the hood — not by reading docs, but by building one from scratch.
 
-I'm an EEE student at NIT Goa who got into systems programming. Most projects I saw online were either too simple or just wrappers around existing tools. I wanted to know what happens at the socket level, how workers coordinate, what makes a system fault-tolerant. So I built it.
+I'm an student at NIT Goa who got into systems programming. Most projects I saw online were either too simple or just wrappers around existing tools. I wanted to know what happens at the socket level, how workers coordinate, what makes a system fault-tolerant. So I built it.
 
 No Celery. No Redis. No shortcuts.
 
