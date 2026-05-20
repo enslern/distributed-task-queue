@@ -2,7 +2,7 @@
 
 Built this to understand how task queues like Celery actually work under the hood — not by reading docs, but by building one from scratch.
 
-I'm an student at NIT Goa who got into systems programming. Most projects I saw online were either too simple or just wrappers around existing tools. I wanted to know what happens at the socket level, how workers coordinate, what makes a system fault-tolerant. So I built it.
+I'm an EEE student at NIT Goa who got into systems programming. Most projects I saw online were either too simple or just wrappers around existing tools. I wanted to know what happens at the socket level, how workers coordinate, what makes a system fault-tolerant. So I built it.
 
 No Celery. No Redis. No shortcuts.
 
@@ -18,18 +18,176 @@ If the worker dies mid-task, the broker detects it via heartbeat timeout and req
 
 ---
 
+## Architecture
+
+### System overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        CLIENT LAYER                             │
+│                                                                 │
+│   client.submit_task("add", 2, 3)   @task decorator            │
+│   AsyncResult.wait_for_result()     result.get_status()        │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ TCP (length-prefixed JSON)
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        BROKER (asyncio)                         │
+│                                                                 │
+│   ┌─────────────┐   ┌──────────────┐   ┌────────────────────┐  │
+│   │ Priority    │   │  Heartbeat   │   │  Worker Registry   │  │
+│   │ Queue       │──▶│  Monitor     │──▶│  (active workers)  │  │
+│   │             │   │  (10s TTL)   │   │                    │  │
+│   └─────────────┘   └──────────────┘   └────────────────────┘  │
+│          │                                        │             │
+│          └──────────────────┬─────────────────────┘            │
+│                             │                                   │
+│                    ┌────────▼────────┐                          │
+│                    │   SQLite DB     │                          │
+│                    │  tasks/results  │                          │
+│                    │  workers        │                          │
+│                    └─────────────────┘                          │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ TCP (length-prefixed JSON)
+          ┌─────────────────┼──────────────────┐
+          ▼                 ▼                  ▼
+┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+│   WORKER 1   │   │   WORKER 2   │   │   WORKER N   │
+│              │   │              │   │              │
+│ ProcessPool  │   │ ProcessPool  │   │ ProcessPool  │
+│ Executor     │   │ Executor     │   │ Executor     │
+│ (4 procs)    │   │ (4 procs)    │   │ (4 procs)    │
+│              │   │              │   │              │
+│ heartbeat    │   │ heartbeat    │   │ heartbeat    │
+│ every 3s     │   │ every 3s     │   │ every 3s     │
+└──────────────┘   └──────────────┘   └──────────────┘
+```
+
+### Message flow — task lifecycle
+
+```
+Client                   Broker                    Worker
+  │                        │                          │
+  │── SUBMIT_TASK ────────▶│                          │
+  │                        │ insert to DB (pending)   │
+  │                        │ push to priority queue   │
+  │◀─ task_id ─────────────│                          │
+  │                        │                          │
+  │                        │◀─ REQUEST_TASK ──────────│
+  │                        │── TASK_ASSIGNED ────────▶│
+  │                        │ update DB (running)      │
+  │                        │                          │ execute in
+  │                        │                          │ ProcessPool
+  │                        │                          │
+  │                        │◀─ TASK_RESULT ───────────│
+  │                        │ save to results table    │
+  │                        │ update DB (success)      │
+  │                        │                          │
+  │── GET_RESULT ─────────▶│                          │
+  │◀─ result ──────────────│                          │
+```
+
+### Failure & retry flow
+
+```
+Worker                   Broker                    New Worker
+  │                        │                          │
+  │ task fails             │                          │
+  │ retry_count += 1       │                          │
+  │── SUBMIT_TASK ────────▶│ (new task_id,            │
+  │   (retry_count=N)      │  retry_count=N)          │
+  │                        │ push back to queue       │
+  │                        │                          │
+  │ [if retry_count        │                          │
+  │  >= MAX_RETRIES]       │                          │
+  │── TASK_RESULT ────────▶│ status = failed          │
+  │   (status=failed)      │ (dead letter queue)      │
+  │                        │                          │
+  │ [if worker crashes]    │                          │
+  ✗ (no heartbeat)         │ 10s timeout              │
+                           │ requeue task             │
+                           │── TASK_ASSIGNED ────────▶│
+```
+
+### Broker crash recovery
+
+```
+Broker restart
+     │
+     ▼
+Query SQLite:
+SELECT * FROM tasks
+WHERE status IN ('pending', 'running')
+     │
+     ▼
+Push all back into priority queue
+     │
+     ▼
+Resume normal operation
+(zero task loss)
+```
+
+### TCP protocol — message framing
+
+```
+┌────────────────┬──────────────────────────────────────┐
+│   4 bytes      │           N bytes                    │
+│  (big-endian)  │         (JSON payload)               │
+│   length = N   │  {"type": "SUBMIT_TASK", ...}        │
+└────────────────┴──────────────────────────────────────┘
+```
+
+Every message is prefixed with its length so the receiver knows exactly how many bytes to read — no delimiter scanning, no partial reads.
+
+### Priority queue internals
+
+```
+heap entry: (-priority, counter, task)
+                │           │
+                │           └── tiebreaker — preserves
+                │               FIFO order within same priority
+                └── negated so higher priority = smaller heap value
+                    (Python heapq is a min-heap)
+```
+
+### Database schema
+
+```
+tasks
+├── task_id        TEXT  PRIMARY KEY
+├── function_name  TEXT
+├── args           TEXT  (JSON)
+├── status         TEXT  (pending / running / success / failed)
+├── priority       INTEGER
+├── retry_count    INTEGER
+└── created_time   TEXT
+
+results
+├── task_id        TEXT  PRIMARY KEY → tasks.task_id
+├── result         TEXT  (JSON)
+├── status         TEXT
+└── finished_at    TEXT
+
+workers
+├── worker_id      TEXT  PRIMARY KEY
+├── last_heartbeat REAL
+└── active_task_id TEXT
+```
+
+---
+
 ## How to run
 
 Three terminals.
 
 ```bash
-# terminal 1 — start the broker
+# terminal 1 — broker
 python -m broker.server
 
-# terminal 2 — start a worker (run multiple for concurrency)
+# terminal 2 — worker (run multiple for concurrency)
 python -m worker.worker
 
-# terminal 3 — start the dashboard
+# terminal 3 — dashboard
 python -m dashboard.app
 ```
 
@@ -106,8 +264,69 @@ shared/
 dashboard/
     app.py          FastAPI server, REST endpoints, live charts
 
+tests/
+    test_integration.py   core task flow tests
+    test_chaos.py         failure, flood, and retry tests
+
 main.py             example — submit tasks and fetch results
 ```
+
+---
+
+## Tests
+
+Two test suites, 8 tests total. All run automatically — no broker or worker needs to be started manually, the fixture spins them up as background threads.
+
+```bash
+pytest tests/
+```
+
+### Integration tests — `test_integration.py`
+
+| Test | What it verifies |
+|---|---|
+| `test_submit_and_get_result` | Task submitted, executed, result correct |
+| `test_priority_respected` | Higher priority task completes successfully |
+| `test_unknown_task_fails` | Unknown function name returns `status=failed` |
+| `test_multiple_tasks` | 5 concurrent tasks all complete with correct results |
+
+### Chaos tests — `test_chaos.py`
+
+| Test | What it verifies |
+|---|---|
+| `test_worker_crash_tasks_recovered` | Worker dies mid-task, broker detects via heartbeat timeout, task requeued and completed by new worker |
+| `test_flood_queue` | 50 tasks submitted rapidly, at least 80% complete successfully without system crash or task loss |
+| `test_broker_restart_recovery` | Tasks persisted to SQLite, all tracked after submission |
+| `test_retry_on_failure` | Flaky tasks (70% failure rate) always reach a terminal state, system never gets stuck |
+
+### Key testing decisions
+
+**Polling instead of `time.sleep`**
+
+All tests poll for results instead of sleeping for a fixed duration. Sleep-based tests are inherently flaky — they pass on fast machines and fail on slow ones. Polling exits as soon as the result is ready and fails with a clear timeout message if it isn't.
+
+```python
+# wrong — races against async execution
+time.sleep(1)
+assert client.get_result(task_id)["status"] == "success"
+
+# right — waits exactly as long as needed
+deadline = time.time() + 10
+while time.time() < deadline:
+    result = client.get_result(task_id)
+    if result["status"] != "pending":
+        break
+    time.sleep(0.2)
+assert result["status"] == "success"
+```
+
+**Why `test_retry_on_failure` submits 5 tasks**
+
+`flaky` succeeds 30% of the time on first attempt. Testing a single task would give a 30% false-pass rate. Submitting 5 tasks reduces that to 0.3⁵ = 0.24% — essentially deterministic. The test asserts all 5 reach a terminal state, proving the system never gets stuck regardless of random failure patterns.
+
+**Why `retry_count > 0` is not asserted**
+
+Asserting on random behaviour makes tests non-deterministic. If all 5 flaky tasks happen to succeed on first attempt, that's correct system behaviour — not a test failure. The meaningful assertion is that tasks always resolve.
 
 ---
 
@@ -131,7 +350,7 @@ Every task is written to the database on submission. On broker restart, the firs
 
 **Exponential backoff on retries**
 
-Retrying instantly after a failure doesn't help if the underlying issue needs time to resolve. Failed tasks wait 2^retry_count seconds between attempts — 1s, 2s, 4s — before being sent to the dead letter queue after max retries.
+Retrying instantly after a failure doesn't help if the underlying issue needs time to resolve. Failed tasks wait 2^retry_count seconds between attempts — 2s, 4s, 8s — before being sent to the dead letter queue after max retries.
 
 **Priority queue with counter tiebreaker**
 
@@ -148,6 +367,8 @@ Python's PriorityQueue compares the full tuple on equal priorities. Comparing Ta
 - SQLite as a lightweight persistence layer for crash recovery
 - Priority queues, scheduling algorithms, and the tradeoffs between them
 - Building REST APIs with FastAPI and serving live data to a frontend
+- Why sleep-based tests are flaky and how to write polling-based tests for async systems
+- How distributed systems create subtle test isolation problems (stale DB state bleeding across tests)
 
 ---
 
@@ -160,6 +381,7 @@ Python's PriorityQueue compares the full tuple on equal priorities. Comparing Ta
 | Persistence | SQLite |
 | Dashboard | FastAPI, Chart.js |
 | Protocol | JSON over length-prefixed TCP frames |
+| Tests | pytest |
 | Language | Python 3.13 |
 
 ---
